@@ -11,10 +11,21 @@ import argparse
 # --- CallScheduler CLASS ---
 
 class CallScheduler:
-    def __init__(self, residents_info, fixed_assignments, holidays, pto_requests=None, transitions=None, pgy4_cap=None, previous_call_counts=None):
+    def __init__(self, residents_info, fixed_assignments, holidays, pto_requests=None, transitions=None, pgy4_cap=None, previous_call_counts=None, soft_constraints=None):
+        with open("debug_prev_counts_engine.txt", "w") as f:
+            f.write(str(previous_call_counts))
         self.residents_info = residents_info
         self.fixed_assignments = fixed_assignments
         self.holidays = holidays
+        
+        # Initialize logs
+        self.call_log = {}
+        self.backup_log = {}
+        self.intern_log = {}
+        
+        # Helper to populate logs with fixed assignments
+        self._populate_fixed_assignments_logs()
+        
         if isinstance(pto_requests, pd.DataFrame):
             if not pto_requests.empty:
                 pto_dict = {}
@@ -39,6 +50,22 @@ class CallScheduler:
             self.pto_requests = pto_requests
         else:
             self.pto_requests = {}
+        
+        # Process soft constraints (assume already filtered by block in run_scheduling_engine)
+        self.soft_constraints = {}
+        self.soft_constraint_violations = []
+        if isinstance(soft_constraints, pd.DataFrame) and not soft_constraints.empty:
+            for _, row in soft_constraints.iterrows():
+                resident = row['Resident']
+                start = row['Start Date']
+                end = row['End Date']
+                if pd.isna(start) or pd.isna(end):
+                    continue  # skip invalid dates
+                current = start
+                while current <= end:
+                    self.soft_constraints.setdefault(resident, []).append(current.strftime('%Y-%m-%d'))
+                    current += timedelta(days=1)
+        
         self.transitions = transitions if transitions else {}
         self.pgy4_cap = pgy4_cap
         
@@ -52,16 +79,23 @@ class CallScheduler:
         # Initialize call counts with previous values if provided
         self.call_counts = {}
         for resident in self.get_all_residents():
-            if previous_call_counts and resident in previous_call_counts:
-                prev_counts = previous_call_counts[resident]
+            norm = self.norm_name(resident)
+            if previous_call_counts and norm in previous_call_counts:
+                prev_counts = previous_call_counts[norm]
                 self.call_counts[resident] = {
-                    "weekday": prev_counts.get("Weekday", 0),
-                    "friday": prev_counts.get("Fridays", 0),
-                    "sunday": prev_counts.get("Sunday", 0),
-                    "saturday": prev_counts.get("Saturday", 0),
-                    "total": prev_counts.get("Total", 0),
+                    "weekday": 0,
+                    "friday": 0,
+                    "sunday": 0,
+                    "saturday": 0,
+                    "total": 0,
+                    "block_total": 0,  # Per-block call count for PGY-4 cap
                     "intern_weekday": 0,
-                    "intern_saturday": 0
+                    "intern_saturday": 0,
+                    "prev_weekday": prev_counts.get("Weekday", 0),
+                    "prev_friday": prev_counts.get("Fridays", 0),
+                    "prev_sunday": prev_counts.get("Sunday", 0),
+                    "prev_saturday": prev_counts.get("Saturday", 0),
+                    "prev_total": prev_counts.get("Total", 0),
                 }
             else:
                 self.call_counts[resident] = {
@@ -70,14 +104,26 @@ class CallScheduler:
                     "sunday": 0,
                     "saturday": 0,
                     "total": 0,
+                    "block_total": 0,  # Per-block call count for PGY-4 cap
                     "intern_weekday": 0,
-                    "intern_saturday": 0
+                    "intern_saturday": 0,
+                    "prev_weekday": 0,
+                    "prev_friday": 0,
+                    "prev_sunday": 0,
+                    "prev_saturday": 0,
+                    "prev_total": 0,
                 }
 
+    def _populate_fixed_assignments_logs(self):
+        """Populate call_log and backup_log with all fixed assignments (holidays, etc)."""
         for date_str, (call, backup) in self.fixed_assignments.items():
             date_obj = dt_type.strptime(date_str, "%Y-%m-%d")
-            self.call_log.setdefault(call, []).append(date_obj)
-            self.backup_log.setdefault(backup, []).append(date_obj)
+            if call not in self.call_log:
+                self.call_log[call] = []
+            self.call_log[call].append(date_obj)
+            if backup not in self.backup_log:
+                self.backup_log[backup] = []
+            self.backup_log[backup].append(date_obj)
 
     def get_all_residents(self):
         return sum(self.residents_info.values(), [])
@@ -154,18 +200,49 @@ class CallScheduler:
     def pto_okay(self, resident, current_date):
         return current_date.strftime("%Y-%m-%d") not in self.pto_requests.get(resident, [])
 
+    def soft_constraint_score(self, resident, current_date):
+        """Calculate how well a soft constraint is satisfied for a resident on a given date"""
+        date_str = current_date.strftime("%Y-%m-%d")
+        if resident in self.soft_constraints and date_str in self.soft_constraints[resident]:
+            return -1  # Penalty for violating soft constraint
+        return 0  # No penalty if no soft constraint exists
+
     def fairness_score(self, resident, dow):
         counts = self.call_counts[resident]
-        score = counts["total"]
-        if dow in [0,1,2,3]:
-            score += counts["weekday"] * 2
-        elif dow == 4:
-            score += counts["friday"] * 3
-        elif dow == 5:
-            score += counts["saturday"] * 2
-        elif dow == 6:
-            score += counts["sunday"] * 3
-        return score
+        # Determine which count to use based on PGY and day of week
+        pgy = None
+        # Try to infer PGY from call eligibility (most recent assignment date)
+        # This is a simplification, but works for fairness sorting
+        for test_pgy, residents in self.residents_info.items():
+            if resident in residents:
+                pgy = test_pgy
+                break
+        # Default to total if PGY not found
+        if pgy is None:
+            return (counts["total"],)
+        # PGY-2: Weekdays, Fridays, Sundays
+        if pgy == 2:
+            if dow in [0,1,2,3]:
+                return (counts["weekday"], counts["total"])
+            elif dow == 4:
+                return (counts["friday"], counts["total"])
+            elif dow == 6:
+                return (counts["sunday"], counts["total"])
+            else:
+                return (counts["total"],)
+        # PGY-3: Weekdays, Saturdays
+        elif pgy == 3:
+            if dow in [0,1,2,3]:
+                return (counts["weekday"], counts["total"])
+            elif dow == 5:
+                return (counts["saturday"], counts["total"])
+            else:
+                return (counts["total"],)
+        # PGY-4: Only total (or add more if needed)
+        elif pgy == 4:
+            return (counts["total"],)
+        # Default fallback
+        return (counts["total"],)
 
     def eligible_residents(self, current_date, role):
         candidates = []
@@ -177,10 +254,10 @@ class CallScheduler:
                 continue
             if not self.pto_okay(r, current_date):
                 continue
-            # Enforce PGY-4 cap for call role
+            # Enforce PGY-4 cap for call role (per block)
             if role == "call" and self.pgy4_cap is not None:
                 pgy = self.get_resident_pgy(r, current_date)
-                if pgy == 4 and self.call_counts[r]["total"] >= self.pgy4_cap:
+                if pgy == 4 and self.call_counts[r]["block_total"] >= self.pgy4_cap:
                     continue
             candidates.append(r)
         return candidates
@@ -194,14 +271,18 @@ class CallScheduler:
             return False
         if not self.pto_okay(intern, current_date):
             return False
+        # Q2 rule: at least one day between intern assignments
+        for prev_date in self.intern_log.get(intern, []):
+            if abs((current_date - prev_date).days) < 2:
+                return False
         return True
 
     def undo_assignment(self, date_str):
         assignment = None
-        for i, (d, c, b, i) in enumerate(self.assignments):
+        for idx, (d, c, b, intern) in enumerate(self.assignments):
             if d == date_str:
-                assignment = (d, c, b, i)
-                self.assignments.pop(i)
+                assignment = (d, c, b, intern)
+                self.assignments.pop(idx)
                 break
         if assignment:
             date_str, call, backup, intern = assignment
@@ -214,6 +295,7 @@ class CallScheduler:
                 self.intern_log[intern].remove(date_obj)
             dow = date_obj.weekday()
             self.call_counts[call]["total"] -= 1
+            self.call_counts[call]["block_total"] -= 1  # Decrement per-block count for PGY-4 cap
             if dow in [0,1,2,3]:
                 self.call_counts[call]["weekday"] -= 1
             elif dow == 4:
@@ -241,10 +323,93 @@ class CallScheduler:
             self.call_log.setdefault(call_fixed, []).append(current_date)
             self.backup_log.setdefault(backup_fixed, []).append(current_date)
             return True
+        
         call_candidates = self.eligible_residents(current_date, "call")
         if not call_candidates:
             return False
-        call_candidates.sort(key=lambda r: self.fairness_score(r, dow))
+        
+        # Apply PGY preference penalties for Wednesdays and Thursdays
+        if current_date.weekday() == 2:  # Wednesday
+            # Prefer PGY-2s over PGY-3s
+            for r in call_candidates:
+                pgy = self.get_resident_pgy(r, current_date)
+                if pgy == 3:
+                    # Add a small penalty to PGY-3s
+                    self.call_counts[r]["total"] += 0.5
+        if current_date.weekday() == 3:  # Thursday
+            # Prefer PGY-4s over PGY-3s (if under cap)
+            for r in call_candidates:
+                pgy = self.get_resident_pgy(r, current_date)
+                if pgy == 3:
+                    self.call_counts[r]["total"] += 0.75
+
+        # Sort candidates by relevant day-type count only
+        fairness_counts = {}
+        for r in call_candidates:
+            counts = self.call_counts[r]
+            pgy = self.get_resident_pgy(r, current_date)
+            if pgy == 2:
+                if dow in [0,1,2,3]:
+                    fairness_counts[r] = counts["weekday"] + counts["prev_weekday"]
+                elif dow == 4:
+                    fairness_counts[r] = counts["friday"] + counts["prev_friday"]
+                elif dow == 6:
+                    fairness_counts[r] = counts["sunday"] + counts["prev_sunday"]
+                else:
+                    fairness_counts[r] = counts["total"] + counts["prev_total"]
+            elif pgy == 3:
+                if dow in [0,1,2,3]:
+                    fairness_counts[r] = counts["weekday"] + counts["prev_weekday"]
+                elif dow == 5:
+                    fairness_counts[r] = counts["saturday"] + counts["prev_saturday"]
+                else:
+                    fairness_counts[r] = counts["total"] + counts["prev_total"]
+            elif pgy == 4:
+                fairness_counts[r] = counts["total"] + counts["prev_total"]
+            else:
+                fairness_counts[r] = counts["total"] + counts["prev_total"]
+        # --- DEBUG OUTPUT ---
+        print(f"\nDEBUG {current_date.strftime('%Y-%m-%d')}: Fairness counts for candidates:")
+        for r in fairness_counts:
+            c = self.call_counts[r]
+            pgy = self.get_resident_pgy(r, current_date)
+            print(f"  {r} (PGY-{pgy}):")
+            print(f"    Current counts: weekday={c['weekday']}, friday={c['friday']}, saturday={c['saturday']}, sunday={c['sunday']}, total={c['total']}")
+            print(f"    Previous counts: weekday={c['prev_weekday']}, friday={c['prev_friday']}, saturday={c['prev_saturday']}, sunday={c['prev_sunday']}, total={c['prev_total']}")
+            print(f"    Combined fairness score: {fairness_counts[r]}")
+
+        # --- Penalty for outliers above the mean ---
+        fairness_values = list(fairness_counts.values())
+        if fairness_values:
+            mean_val = sum(fairness_values) / len(fairness_values)
+            for r in fairness_counts:
+                if fairness_counts[r] > mean_val:
+                    fairness_counts[r] += 1  # Penalty for being above the mean
+
+        # Find the minimum count
+        min_count = min(fairness_counts.values())
+        # Get all candidates with the minimum count
+        min_candidates = [r for r in call_candidates if fairness_counts[r] == min_count]
+        # Pick randomly among them
+        random.shuffle(min_candidates)
+        call_candidates = min_candidates
+
+        # After sorting, remove the penalty so it doesn't affect future days
+        if current_date.weekday() in [2, 3]:
+            for r in call_candidates:
+                pgy = self.get_resident_pgy(r, current_date)
+                if pgy == 3:
+                    self.call_counts[r]["total"] -= 0.5
+
+        # Sort candidates by relevant day-type count, then moderately by total calls, then random
+        call_candidates.sort(
+            key=lambda r: (
+                fairness_counts[r],
+                self.call_counts[r]["total"] * 0.33,
+                random.random()
+            )
+        )
+
         for call_resident in call_candidates:
             call_pgy = self.get_resident_pgy(call_resident, current_date)
             backup_candidates = []
@@ -260,7 +425,13 @@ class CallScheduler:
                     backup_candidates.append(r)
             if not backup_candidates:
                 continue
-            backup_candidates.sort(key=lambda r: self.fairness_score(r, dow))
+            
+            # Sort backup candidates by fairness score and soft constraint score
+            backup_candidates.sort(key=lambda r: (
+                self.fairness_score(r, dow),
+                self.soft_constraint_score(r, current_date)
+            ))
+            
             for backup_resident in backup_candidates:
                 intern_assigned = None
                 if call_pgy in [3, 4]:
@@ -282,24 +453,46 @@ class CallScheduler:
                                         self.call_counts[r]["intern_saturday"]
                                     )
                                 )
+                
                 combination_key = self.get_combination_key(date_str, call_resident, backup_resident, intern_assigned)
                 if combination_key in self.tried_combinations:
                     continue
+                
                 self.tried_combinations.add(combination_key)
                 self.assignments.append((date_str, call_resident, backup_resident, intern_assigned))
                 self.update_counters(call_resident, backup_resident, dow)
                 self.call_log.setdefault(call_resident, []).append(current_date)
                 self.backup_log.setdefault(backup_resident, []).append(current_date)
+                
+                # Track soft constraint violations
+                if call_resident in self.soft_constraints and date_str in self.soft_constraints[call_resident]:
+                    self.soft_constraint_violations.append({
+                        'Date': date_str,
+                        'Resident': call_resident,
+                        'Role': 'Call',
+                        'Type': 'Soft Constraint'
+                    })
+                if backup_resident in self.soft_constraints and date_str in self.soft_constraints[backup_resident]:
+                    self.soft_constraint_violations.append({
+                        'Date': date_str,
+                        'Resident': backup_resident,
+                        'Role': 'Backup',
+                        'Type': 'Soft Constraint'
+                    })
+                
                 if intern_assigned:
                     if dow == 5:
                         self.call_counts[intern_assigned]["intern_saturday"] += 1
                     else:
                         self.call_counts[intern_assigned]["intern_weekday"] += 1
+                    # Update intern_log for q2 rule enforcement
+                    self.intern_log.setdefault(intern_assigned, []).append(current_date)
                 return True
         return False
 
     def update_counters(self, call, backup, dow):
         self.call_counts[call]["total"] += 1
+        self.call_counts[call]["block_total"] += 1  # Increment per-block count for PGY-4 cap
         if dow == 4:
             self.call_counts[call]["friday"] += 1
         elif dow == 5:
@@ -309,28 +502,121 @@ class CallScheduler:
         else:
             self.call_counts[call]["weekday"] += 1
 
-    def schedule_range(self, start_date, end_date):
-        current_date = start_date
-        while current_date <= end_date:
-            date_str = current_date.strftime("%Y-%m-%d")
-            if not self.assign_day(current_date):
-                backtrack_date = current_date - timedelta(days=1)
-                while backtrack_date >= start_date:
-                    self.undo_assignment(backtrack_date.strftime("%Y-%m-%d"))
-                    if self.assign_day(backtrack_date, backtrack=True):
+    def schedule_range(self, start_date, end_date, fairness_weight=0.75, soft_constraint_weight=0.25):
+        # Reset all per-run state at the start of each schedule generation
+        self.assignments = []
+        self.call_log = {}
+        self.backup_log = {}
+        self.intern_log = {}
+        # Re-populate logs with fixed assignments after reset
+        self._populate_fixed_assignments_logs()
+        for resident in self.call_counts:
+            # Only reset current block counts, preserve previous counts
+            self.call_counts[resident]["weekday"] = 0
+            self.call_counts[resident]["friday"] = 0
+            self.call_counts[resident]["saturday"] = 0
+            self.call_counts[resident]["sunday"] = 0
+            self.call_counts[resident]["total"] = 0
+            self.call_counts[resident]["block_total"] = 0
+            self.call_counts[resident]["intern_weekday"] = 0
+            self.call_counts[resident]["intern_saturday"] = 0
+            # Previous counts are preserved
+        self.soft_constraint_violations = []
+        results = []
+        for _ in range(10000):
+            # Reset per-run state
+            self.assignments = []
+            self.call_log = {}
+            self.backup_log = {}
+            self.intern_log = {}
+            # Re-populate logs with fixed assignments after reset
+            self._populate_fixed_assignments_logs()
+            for resident in self.call_counts:
+                # Only reset current block counts, preserve previous counts
+                self.call_counts[resident]["weekday"] = 0
+                self.call_counts[resident]["friday"] = 0
+                self.call_counts[resident]["saturday"] = 0
+                self.call_counts[resident]["sunday"] = 0
+                self.call_counts[resident]["total"] = 0
+                self.call_counts[resident]["block_total"] = 0
+                self.call_counts[resident]["intern_weekday"] = 0
+                self.call_counts[resident]["intern_saturday"] = 0
+                # Previous counts are preserved
+            self.soft_constraint_violations = []
+            current_date = start_date
+            success = True
+            while current_date <= end_date:
+                date_str = current_date.strftime("%Y-%m-%d")
+                if not self.assign_day(current_date):
+                    success = False
+                    break
+                current_date += timedelta(days=1)
+            if not success:
+                continue  # Only keep successful runs
+            violations = len(self.soft_constraint_violations)
+            # Calculate fairness score: sum of spreads for each call type and PGY
+            fairness_score = 0
+            call_type_keys = ["weekday", "friday", "saturday", "sunday"]
+            pgy_groups = {1: [], 2: [], 3: [], 4: []}
+            for resident in self.call_counts:
+                pgy = None
+                for test_pgy, residents in self.residents_info.items():
+                    if resident in residents:
+                        pgy = test_pgy
                         break
-                    backtrack_date -= timedelta(days=1)
-                if backtrack_date < start_date:
-                    raise Exception(f"No valid schedule possible starting from {date_str}")
-            current_date += timedelta(days=1)
+                if pgy:
+                    pgy_groups[pgy].append(resident)
+            for key in call_type_keys:
+                for pgy, group in pgy_groups.items():
+                    if not group:
+                        continue
+                    vals = [self.call_counts[r][key] for r in group]
+                    fairness_score += max(vals) - min(vals)
+            results.append({
+                'assignments': list(self.assignments),
+                'soft_constraint_violations': list(self.soft_constraint_violations),
+                'violations': violations,
+                'fairness': fairness_score
+            })
+        if not results:
+            raise Exception("No valid schedule found for the given constraints.")
+        # Normalize scores
+        min_fair = min(r['fairness'] for r in results)
+        max_fair = max(r['fairness'] for r in results)
+        min_viol = min(r['violations'] for r in results)
+        max_viol = max(r['violations'] for r in results)
+        for r in results:
+            r['fairness_norm'] = 0 if max_fair == min_fair else (r['fairness'] - min_fair) / (max_fair - min_fair)
+            r['violations_norm'] = 0 if max_viol == min_viol else (r['violations'] - min_viol) / (max_viol - min_viol)
+            r['combined_score'] = r['fairness_norm'] * fairness_weight + r['violations_norm'] * soft_constraint_weight
+        # Pick the best
+        best = min(results, key=lambda r: r['combined_score'])
+        self.assignments = best['assignments']
+        self.soft_constraint_violations = best['soft_constraint_violations']
 
     def export_schedule(self):
         df = pd.DataFrame(self.assignments, columns=["Date", "Call", "Backup", "Intern"])
         return df
 
+    def get_soft_constraint_stats(self):
+        """Get statistics about soft constraint violations"""
+        total_constraints = sum(len(dates) for dates in self.soft_constraints.values())
+        violations = len(self.soft_constraint_violations)
+        fulfilled = total_constraints - violations
+        
+        return {
+            'total_constraints': total_constraints,
+            'violations': violations,
+            'fulfilled': fulfilled,
+            'violation_details': self.soft_constraint_violations
+        }
+
+    def norm_name(self, name):
+        return str(name).strip().lower()
+
 # --- Wrapper Function to Connect to App ---
 
-def run_scheduling_engine(prev_df, res_df, pto_df, hol_df, start_date=None, end_date=None, pgy4_cap=None, previous_call_counts=None):
+def run_scheduling_engine(prev_df, res_df, pto_df, hol_df, start_date=None, end_date=None, pgy4_cap=None, previous_call_counts=None, soft_constraints=None, fairness_weight=0.75, soft_constraint_weight=0.25):
     residents_info = {1: [], 2: [], 3: [], 4: []}  # Added PGY-1
     transitions = {}
 
@@ -405,6 +691,29 @@ def run_scheduling_engine(prev_df, res_df, pto_df, hol_df, start_date=None, end_
             backup = row["Backup"]
             fixed_assignments[date_str] = (call, backup)
 
+    # Filter soft constraints to only those within the current block's date range
+    filtered_soft_constraints = None
+    if isinstance(soft_constraints, pd.DataFrame) and not soft_constraints.empty:
+        soft_constraints = soft_constraints.copy()
+        soft_constraints['Start Date'] = pd.to_datetime(soft_constraints['Start Date'], errors='coerce')
+        soft_constraints['End Date'] = pd.to_datetime(soft_constraints['End Date'], errors='coerce')
+        filtered_rows = []
+        for _, row in soft_constraints.iterrows():
+            start = row['Start Date']
+            end = row['End Date']
+            if pd.isna(start) or pd.isna(end):
+                continue
+            # Only include if the range overlaps with the block
+            if end < start_date or start > end_date:
+                continue
+            # Clip to block range
+            row['Start Date'] = max(start, start_date)
+            row['End Date'] = min(end, end_date)
+            filtered_rows.append(row)
+        filtered_soft_constraints = pd.DataFrame(filtered_rows)
+    else:
+        filtered_soft_constraints = soft_constraints
+
     # Create scheduler instance with previous call counts if provided
     scheduler = CallScheduler(
         residents_info, 
@@ -413,11 +722,12 @@ def run_scheduling_engine(prev_df, res_df, pto_df, hol_df, start_date=None, end_
         pto_requests, 
         transitions, 
         pgy4_cap=pgy4_cap,
-        previous_call_counts=previous_call_counts
+        previous_call_counts=previous_call_counts,
+        soft_constraints=filtered_soft_constraints
     )
     
     # Generate schedule
-    scheduler.schedule_range(start_date, end_date)
+    scheduler.schedule_range(start_date, end_date, fairness_weight, soft_constraint_weight)
     
     # Export schedule and add supervisor assignment
     df = scheduler.export_schedule()
@@ -457,7 +767,25 @@ def run_scheduling_engine(prev_df, res_df, pto_df, hol_df, start_date=None, end_
         return pgy_by_name.get(resident, None)
 
     # Supervisor assignment tracking
-    supervisor_counts = {r: 0 for r in scheduler.get_all_residents() if get_pgy(r, start_date) in [3, 4]}
+    supervisor_counts = {}
+    # Robustly check and convert start_date and end_date
+    print(f"start_date: {start_date} (type: {type(start_date)})")
+    print(f"end_date: {end_date} (type: {type(end_date)})")
+    try:
+        start_date = pd.to_datetime(start_date)
+        end_date = pd.to_datetime(end_date)
+    except Exception as e:
+        raise ValueError(f"Error converting start/end to datetime: {e}")
+    if pd.isna(start_date) or pd.isna(end_date):
+        raise ValueError("Start date or end date is NaT or invalid. Please check your input.")
+    else:
+        for r in scheduler.get_all_residents():
+            # Initialize counts for all residents who will be PGY-3 or PGY-4 at any point
+            for date in pd.date_range(start_date, end_date):
+                if get_pgy(r, date) in [3, 4]:
+                    supervisor_counts[r] = 0
+                    break
+
     last_call_by_resident = {}
 
     for idx, row in df.iterrows():
@@ -480,7 +808,8 @@ def run_scheduling_engine(prev_df, res_df, pto_df, hol_df, start_date=None, end_
             if call_by_date.get(prev_date) == r:
                 continue
             # Must be PGY-3 or PGY-4 on this date
-            if get_pgy(r, current_date) not in [3, 4]:
+            pgy = get_pgy(r, current_date)
+            if pgy not in [3, 4]:
                 continue
             # Check PTO
             if current_date.strftime("%Y-%m-%d") in pto_requests.get(r, []):
@@ -490,6 +819,13 @@ def run_scheduling_engine(prev_df, res_df, pto_df, hol_df, start_date=None, end_
         if current_date.weekday() == 4:  # Friday
             sat_date = (current_date + timedelta(days=1)).strftime("%Y-%m-%d")
             sat_call = call_by_date.get(sat_date)
+            if sat_call is not None and sat_call not in eligible_supervisors:
+                # If the Saturday call resident will be PGY-3/4 on Saturday, allow as supervisor for Friday
+                if get_pgy(sat_call, current_date + timedelta(days=1)) in [3, 4]:
+                    # Also check not on call the previous day and not on PTO for Friday
+                    prev_date = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
+                    if call_by_date.get(prev_date) != sat_call and current_date.strftime("%Y-%m-%d") not in pto_requests.get(sat_call, []):
+                        eligible_supervisors.append(sat_call)
             if sat_call in eligible_supervisors:
                 df.at[idx, "Supervisor"] = sat_call
                 supervisor_counts[sat_call] += 1
@@ -503,23 +839,8 @@ def run_scheduling_engine(prev_df, res_df, pto_df, hol_df, start_date=None, end_
             # If no one is eligible, leave blank (or could relax rule/log warning)
             df.at[idx, "Supervisor"] = None
 
-    # Check if the current day is Wednesday (0 = Monday, 2 = Wednesday)
-    if current_date.weekday() == 2:
-        # Adjust call count for PGY-3s on Wednesdays
-        for r in df["Call"]:
-            pgy = get_pgy(r, current_date)
-            if pgy == 3:
-                # Add a small penalty (0.5) to the call count for PGY-3s on Wednesdays
-                self.call_counts[r]["total"] += 0.5
-
-    # Check if the current day is Thursday (0 = Monday, 3 = Thursday)
-    if current_date.weekday() == 3:
-        # Adjust call count for PGY-3s on Thursdays
-        for r in df["Call"]:
-            pgy = get_pgy(r, current_date)
-            if pgy == 3:
-                # Add a small penalty (0.5) to the call count for PGY-3s on Thursdays
-                self.call_counts[r]["total"] += 0.75
+    # Add soft constraint statistics to the DataFrame's attributes
+    df.attrs['soft_constraint_stats'] = scheduler.get_soft_constraint_stats()
 
     return df
 
