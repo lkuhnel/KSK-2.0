@@ -14,23 +14,6 @@ from gmail_fetcher import fetch_requests_from_gmail, ensure_date
 import traceback
 import copy
 
-# Initialize all required session state keys to avoid KeyError
-required_session_keys = [
-    'show_results_by_block',
-    'last_schedule_df_by_block',
-    'last_stats_by_block',
-    'last_excel_file_by_block',
-    'last_block_name_by_block',
-    'last_success_by_block',
-    'last_call_distribution_by_block',
-    'last_pgy_stats_by_block',
-    'last_csv_buffer_by_block',
-    'last_soft_constraint_stats_by_block',
-]
-for key in required_session_keys:
-    if key not in st.session_state:
-        st.session_state[key] = {}
-
 # After imports, add:
 def norm_name(name):
     return str(name).strip().lower()
