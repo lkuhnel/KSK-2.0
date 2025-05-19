@@ -92,6 +92,28 @@ if 'disable_pto_by_block' not in st.session_state:
 if 'disable_soft_constraints_by_block' not in st.session_state:
     st.session_state.disable_soft_constraints_by_block = {}
 
+# Initialize results-related session state variables
+if 'show_results_by_block' not in st.session_state:
+    st.session_state.show_results_by_block = {}
+if 'last_schedule_df_by_block' not in st.session_state:
+    st.session_state.last_schedule_df_by_block = {}
+if 'last_stats_by_block' not in st.session_state:
+    st.session_state.last_stats_by_block = {}
+if 'last_excel_file_by_block' not in st.session_state:
+    st.session_state.last_excel_file_by_block = {}
+if 'last_block_name_by_block' not in st.session_state:
+    st.session_state.last_block_name_by_block = {}
+if 'last_success_by_block' not in st.session_state:
+    st.session_state.last_success_by_block = {}
+if 'last_call_distribution_by_block' not in st.session_state:
+    st.session_state.last_call_distribution_by_block = {}
+if 'last_pgy_stats_by_block' not in st.session_state:
+    st.session_state.last_pgy_stats_by_block = {}
+if 'last_csv_buffer_by_block' not in st.session_state:
+    st.session_state.last_csv_buffer_by_block = {}
+if 'last_soft_constraint_stats_by_block' not in st.session_state:
+    st.session_state.last_soft_constraint_stats_by_block = {}
+
 def safe_int(val):
     return 0 if pd.isna(val) else int(val)
 
@@ -894,41 +916,94 @@ with tabs[5]:
         
         if uploaded_files:
             try:
-                all_counts = {}
                 # Always treat uploaded_files as a list for uniform processing
                 files = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
-                for file in files:
-                    # Handle both file-like and bytes objects
+                block_file_map = {}
+                if block_choice == "Block 3":
+                    # Try to auto-detect block from filename
+                    for file in files:
+                        fname = file.name.lower()
+                        if "block_1" in fname:
+                            block_file_map["Block 1"] = file
+                        elif "block_2" in fname:
+                            block_file_map["Block 2"] = file
+                    # If not both found, prompt user to assign
+                    missing_blocks = [b for b in ["Block 1", "Block 2"] if b not in block_file_map]
+                    if missing_blocks:
+                        for b in missing_blocks:
+                            st.warning(f"Please assign a file for {b}.")
+                            file_options = [file.name for file in files if file.name not in [f.name for f in block_file_map.values()]]
+                            selected_file = st.selectbox(f"Select file for {b}", file_options, key=f"select_{b}")
+                            for file in files:
+                                if file.name == selected_file:
+                                    block_file_map[b] = file
+                                    break
+                    # Now process each file for its block
+                    for b, file in block_file_map.items():
+                        if hasattr(file, 'seek'):
+                            file.seek(0)
+                            df = pd.read_csv(file)
+                        else:
+                            s = file.decode('utf-8')
+                            df = pd.read_csv(io.StringIO(s))
+                        # Ensure all expected columns are present
+                        for col in ['Resident', 'Weekday', 'Fridays', 'Saturday', 'Sunday', 'Total']:
+                            if col not in df.columns:
+                                df[col] = 0
+                        all_counts = {}
+                        for _, row in df.iterrows():
+                            resident = norm_name(row['Resident'])
+                            display_name = str(row['Resident']).strip()
+                            if resident not in all_counts:
+                                all_counts[resident] = {
+                                    'display_name': display_name,
+                                    'Weekday': safe_int_nan(row.get('Weekday', 0)),
+                                    'Fridays': safe_int_nan(row.get('Fridays', 0)),
+                                    'Saturday': safe_int_nan(row.get('Saturday', 0)),
+                                    'Sunday': safe_int_nan(row.get('Sunday', 0)),
+                                    'Total': safe_int_nan(row.get('Total', 0))
+                                }
+                            else:
+                                all_counts[resident]['Weekday'] += safe_int_nan(row.get('Weekday', 0))
+                                all_counts[resident]['Fridays'] += safe_int_nan(row.get('Fridays', 0))
+                                all_counts[resident]['Saturday'] += safe_int_nan(row.get('Saturday', 0))
+                                all_counts[resident]['Sunday'] += safe_int_nan(row.get('Sunday', 0))
+                                all_counts[resident]['Total'] += safe_int_nan(row.get('Total', 0))
+                        st.session_state.previous_call_counts_by_block[b] = all_counts
+                    st.success("Successfully processed previous call counts!")
+                else:
+                    # Block 2 or other: just process the first file for this block
+                    file = files[0]
                     if hasattr(file, 'seek'):
                         file.seek(0)
                         df = pd.read_csv(file)
                     else:
-                        # file is bytes, decode to string and use StringIO
                         s = file.decode('utf-8')
                         df = pd.read_csv(io.StringIO(s))
-                    # Ensure all expected columns are present
                     for col in ['Resident', 'Weekday', 'Fridays', 'Saturday', 'Sunday', 'Total']:
                         if col not in df.columns:
                             df[col] = 0
+                    all_counts = {}
                     for _, row in df.iterrows():
                         resident = norm_name(row['Resident'])
                         display_name = str(row['Resident']).strip()
                         if resident not in all_counts:
                             all_counts[resident] = {
                                 'display_name': display_name,
-                                'Weekday': 0,
-                                'Fridays': 0,
-                                'Saturday': 0,
-                                'Sunday': 0,
-                                'Total': 0
+                                'Weekday': safe_int_nan(row.get('Weekday', 0)),
+                                'Fridays': safe_int_nan(row.get('Fridays', 0)),
+                                'Saturday': safe_int_nan(row.get('Saturday', 0)),
+                                'Sunday': safe_int_nan(row.get('Sunday', 0)),
+                                'Total': safe_int_nan(row.get('Total', 0))
                             }
-                        all_counts[resident]['Weekday'] += safe_int_nan(row.get('Weekday', 0))
-                        all_counts[resident]['Fridays'] += safe_int_nan(row.get('Fridays', 0))
-                        all_counts[resident]['Saturday'] += safe_int_nan(row.get('Saturday', 0))
-                        all_counts[resident]['Sunday'] += safe_int_nan(row.get('Sunday', 0))
-                        all_counts[resident]['Total'] += safe_int_nan(row.get('Total', 0))
-                st.session_state.previous_call_counts_by_block[block_choice] = all_counts
-                st.success("Successfully processed previous call counts!")
+                        else:
+                            all_counts[resident]['Weekday'] += safe_int_nan(row.get('Weekday', 0))
+                            all_counts[resident]['Fridays'] += safe_int_nan(row.get('Fridays', 0))
+                            all_counts[resident]['Saturday'] += safe_int_nan(row.get('Saturday', 0))
+                            all_counts[resident]['Sunday'] += safe_int_nan(row.get('Sunday', 0))
+                            all_counts[resident]['Total'] += safe_int_nan(row.get('Total', 0))
+                    st.session_state.previous_call_counts_by_block[block_choice] = all_counts
+                    st.success("Successfully processed previous call counts!")
             except Exception as e:
                 st.error(f"Error processing files: {str(e)}")
                 st.error("Please make sure you're uploading the correct call statistics CSV files.")
